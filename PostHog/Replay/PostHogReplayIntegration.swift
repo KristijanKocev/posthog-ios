@@ -19,11 +19,13 @@
         let maskAllTextInputs: Bool
         let maskAllImages: Bool
         let maskAllSandboxedViews: Bool
+        let hasAutomaticMasking: Bool
 
         init(from config: PostHogConfig?) {
             maskAllTextInputs = config?.sessionReplayConfig.maskAllTextInputs ?? true
             maskAllImages = config?.sessionReplayConfig.maskAllImages ?? true
             maskAllSandboxedViews = config?.sessionReplayConfig.maskAllSandboxedViews ?? true
+            hasAutomaticMasking = maskAllTextInputs || maskAllImages
         }
     }
 
@@ -44,18 +46,14 @@
         private let windowViewsLock = NSLock()
         private let windowViews = NSMapTable<UIWindow, ViewTreeSnapshotStatus>.weakToStrongObjects()
         private let installedPluginsLock = NSLock()
-        private var displayLink: CADisplayLink?
-        private var lastSnapshotAt: Date?
+        private var applicationEventToken: RegistrationToken?
         private var applicationBackgroundedToken: RegistrationToken?
         private var applicationForegroundedToken: RegistrationToken?
-        private var applicationEventToken: RegistrationToken?
+        private var viewLayoutToken: RegistrationToken?
         private var remoteConfigLoadedToken: RegistrationToken?
         private var sessionIdChangedToken: RegistrationToken?
         private var eventCapturedToken: RegistrationToken?
         private var installedPlugins: [PostHogSessionReplayPlugin] = []
-        private let snapshotStateLock = NSLock()
-        private var snapshotCaptureInFlight = false
-        private var snapshotPending = false
 
         private let eventTriggersLock = NSLock()
         private var eventTriggers: [String]?
@@ -240,7 +238,11 @@
 
             // flutter captures snapshots, so we don't need to capture them here
             if isNotFlutter() {
-                startDisplayLink()
+                let interval = postHog.config.sessionReplayConfig.throttleDelay
+                viewLayoutToken = DI.main.viewLayoutPublisher.onViewLayout.subscribe(throttle: interval) { [weak self] in
+                    // called on main thread
+                    self?.snapshot()
+                }
             }
 
             // start listening to `UIApplication.sendEvent`
@@ -288,8 +290,6 @@
         func stop() {
             guard isEnabled else { return }
             isEnabled = false
-            stopDisplayLink()
-            resetSnapshotSchedulingState()
             resetViews()
             sessionIdChangedToken = nil
 
@@ -298,6 +298,8 @@
             // stop listening to Application lifecycle events
             applicationBackgroundedToken = nil
             applicationForegroundedToken = nil
+            // stop listening to `UIView.layoutSubviews` events
+            viewLayoutToken = nil
             // stop plugins
             let pluginsToStop = installedPluginsLock.withLock {
                 defer { installedPlugins = [] }
@@ -319,67 +321,6 @@
             // Ensure thread-safe access to windowViews
             windowViewsLock.withLock {
                 windowViews.removeAllObjects()
-            }
-        }
-
-        private func startDisplayLink() {
-            guard displayLink == nil else { return }
-
-            lastSnapshotAt = Date()
-            let displayLink = CADisplayLink(target: self, selector: #selector(newFrame(_:)))
-            displayLink.add(to: .main, forMode: .common)
-            self.displayLink = displayLink
-        }
-
-        private func stopDisplayLink() {
-            displayLink?.invalidate()
-            displayLink = nil
-            lastSnapshotAt = nil
-        }
-
-        @objc private func newFrame(_ sender: CADisplayLink) {
-            guard let postHog, isEnabled, let lastSnapshotAt else { return }
-
-            let now = Date()
-            if now.timeIntervalSince(lastSnapshotAt) >= postHog.config.sessionReplayConfig.throttleDelay {
-                snapshot()
-                self.lastSnapshotAt = now
-            }
-        }
-
-        private func beginSnapshotCapture() -> Bool {
-            snapshotStateLock.withLock {
-                if snapshotCaptureInFlight {
-                    snapshotPending = true
-                    return false
-                }
-
-                snapshotCaptureInFlight = true
-                return true
-            }
-        }
-
-        private func finishSnapshotCapture() {
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-
-                let shouldScheduleNext = self.snapshotStateLock.withLock {
-                    self.snapshotCaptureInFlight = false
-                    let shouldScheduleNext = self.snapshotPending
-                    self.snapshotPending = false
-                    return shouldScheduleNext
-                }
-
-                if shouldScheduleNext {
-                    self.snapshot()
-                }
-            }
-        }
-
-        private func resetSnapshotSchedulingState() {
-            snapshotStateLock.withLock {
-                snapshotCaptureInFlight = false
-                snapshotPending = false
             }
         }
 
@@ -486,10 +427,10 @@
             // capture necessary touch information on the main thread before performing any asynchronous operations
             // - this ensures that UITouch associated objects like UIView, UIWindow, or [UIGestureRecognizer] are still valid.
             // - these objects may be released or erased by the system if accessed asynchronously, resulting in invalid/zeroed-out touch coordinates
-            // Only capture began/ended phases — other phases (moved, stationary, cancelled) are ignored
+            // Capture began/moved/ended phases so scrolling and drag gestures are represented in replay activity
             let touchInfo = touches.compactMap { touch -> (phase: UITouch.Phase, location: CGPoint)? in
                 let phase = touch.phase
-                guard phase == .began || phase == .ended else { return nil }
+                guard phase == .began || phase == .moved || phase == .ended else { return nil }
                 return (phase: phase, location: touch.location(in: window))
             }
 
@@ -503,10 +444,20 @@
                 guard let postHog else { return }
 
                 var snapshotsData: [Any] = []
-                // touchInfo already filtered to only .began and .ended phases
+                // touchInfo already filtered to only .began, .moved, and .ended phases
                 let timestamp = date.toMillis()
                 for touch in touchInfo {
-                    let type: Int = touch.phase == .began ? 7 : 9
+                    let type: Int
+                    switch touch.phase {
+                    case .began:
+                        type = 7
+                    case .moved:
+                        type = 8
+                    case .ended:
+                        type = 9
+                    default:
+                        continue
+                    }
 
                     guard touch.location != .zero else {
                         continue
@@ -691,94 +642,96 @@
                 return
             }
 
-            // UIKit type checks — if-else chain ensures only one type cast succeeds.
-            // Views that don't match any known UIKit type fall through to SwiftUI/RN checks below.
-            if let textView = view as? UITextView {
-                if isTextViewSensitive(textView, maskConfig) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
-                    return
-                }
-            } else if let textField = view as? UITextField {
-                if isTextFieldSensitive(textField, maskConfig) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
-                    return
-                }
-            } else if let image = view as? UIImageView {
-                if isImageViewSensitive(image, maskConfig) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
-                    return
-                }
-            } else if let label = view as? UILabel {
-                if isLabelSensitive(label, maskConfig) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
-                    return
-                }
-            } else if let button = view as? UIButton {
-                if isButtonSensitive(button, maskConfig) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
-                    return
-                }
-            } else if let webView = view as? WKWebView {
-                if isAnyInputSensitive(webView, maskConfig) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
-                    return
-                }
-            } else if let theSwitch = view as? UISwitch {
-                if isSwitchSensitive(theSwitch, maskConfig) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
-                    return
-                }
-            } else if view is UIPickerView {
-                if isTextInputSensitive(view, maskConfig), view.subviews.isEmpty {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
-                    return
-                }
-            } else if !(view is UIScrollView || view is UITableViewCell || view is UICollectionViewCell) {
-                // Not a known UIKit type — check React Native and SwiftUI types
-
-                // React Native checks (only when RN classes are loaded)
-                if let reactNativeTextView = reactNativeTextView,
-                   view.isKind(of: reactNativeTextView), maskConfig.maskAllTextInputs
-                {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
-                    return
-                }
-
-                if let reactNativeImageView = reactNativeImageView,
-                   view.isKind(of: reactNativeImageView), maskConfig.maskAllImages
-                {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
-                    return
-                }
-
-                let hasSubViews = !view.subviews.isEmpty
-
-                /// SwiftUI: Text based views like `Text`, `Button`, `TextEditor`
-                if swiftUITextBasedViewTypes.contains(where: view.isKind(of:)) {
-                    if isTextInputSensitive(view, maskConfig), !hasSubViews {
+            if maskConfig.hasAutomaticMasking {
+                // UIKit type checks — if-else chain ensures only one type cast succeeds.
+                // Views that don't match any known UIKit type fall through to SwiftUI/RN checks below.
+                if let textView = view as? UITextView {
+                    if isTextViewSensitive(textView, maskConfig) {
                         maskableWidgets.append(view.toAbsoluteRect(window))
                         return
                     }
-                }
-
-                /// SwiftUI: Image based views like `Image`, `AsyncImage`
-                if swiftUIImageLayerTypes.contains(where: view.layer.isKind(of:)) {
-                    if isSwiftUIImageSensitive(view, maskConfig), !hasSubViews {
+                } else if let textField = view as? UITextField {
+                    if isTextFieldSensitive(textField, maskConfig) {
                         maskableWidgets.append(view.toAbsoluteRect(window))
                         return
                     }
-                }
-
-                // SwiftUI iOS 26 (new SwiftUI rendering engine in Xcode 26)
-                if #available(iOS 26.0, *) {
-                    findMaskableLayers(view.layer, view, window, &maskableWidgets, maskConfig)
-                }
-
-                // this can be anything, so better to be conservative
-                if swiftUIGenericTypes.contains(where: { view.isKind(of: $0) }), !isSwiftUILayerSafe(view.layer) {
-                    if isTextInputSensitive(view, maskConfig), !hasSubViews {
+                } else if let image = view as? UIImageView {
+                    if isImageViewSensitive(image, maskConfig) {
                         maskableWidgets.append(view.toAbsoluteRect(window))
                         return
+                    }
+                } else if let label = view as? UILabel {
+                    if isLabelSensitive(label, maskConfig) {
+                        maskableWidgets.append(view.toAbsoluteRect(window))
+                        return
+                    }
+                } else if let button = view as? UIButton {
+                    if isButtonSensitive(button, maskConfig) {
+                        maskableWidgets.append(view.toAbsoluteRect(window))
+                        return
+                    }
+                } else if let webView = view as? WKWebView {
+                    if isAnyInputSensitive(webView, maskConfig) {
+                        maskableWidgets.append(view.toAbsoluteRect(window))
+                        return
+                    }
+                } else if let theSwitch = view as? UISwitch {
+                    if isSwitchSensitive(theSwitch, maskConfig) {
+                        maskableWidgets.append(view.toAbsoluteRect(window))
+                        return
+                    }
+                } else if view is UIPickerView {
+                    if isTextInputSensitive(view, maskConfig), view.subviews.isEmpty {
+                        maskableWidgets.append(view.toAbsoluteRect(window))
+                        return
+                    }
+                } else if !(view is UIScrollView || view is UITableViewCell || view is UICollectionViewCell) {
+                    // Not a known UIKit type — check React Native and SwiftUI types
+
+                    // React Native checks (only when RN classes are loaded)
+                    if let reactNativeTextView = reactNativeTextView,
+                       view.isKind(of: reactNativeTextView), maskConfig.maskAllTextInputs
+                    {
+                        maskableWidgets.append(view.toAbsoluteRect(window))
+                        return
+                    }
+
+                    if let reactNativeImageView = reactNativeImageView,
+                       view.isKind(of: reactNativeImageView), maskConfig.maskAllImages
+                    {
+                        maskableWidgets.append(view.toAbsoluteRect(window))
+                        return
+                    }
+
+                    let hasSubViews = !view.subviews.isEmpty
+
+                    /// SwiftUI: Text based views like `Text`, `Button`, `TextEditor`
+                    if swiftUITextBasedViewTypes.contains(where: view.isKind(of:)) {
+                        if isTextInputSensitive(view, maskConfig), !hasSubViews {
+                            maskableWidgets.append(view.toAbsoluteRect(window))
+                            return
+                        }
+                    }
+
+                    /// SwiftUI: Image based views like `Image`, `AsyncImage`
+                    if swiftUIImageLayerTypes.contains(where: view.layer.isKind(of:)) {
+                        if isSwiftUIImageSensitive(view, maskConfig), !hasSubViews {
+                            maskableWidgets.append(view.toAbsoluteRect(window))
+                            return
+                        }
+                    }
+
+                    // SwiftUI iOS 26 (new SwiftUI rendering engine in Xcode 26)
+                    if #available(iOS 26.0, *) {
+                        findMaskableLayers(view.layer, view, window, &maskableWidgets, maskConfig)
+                    }
+
+                    // this can be anything, so better to be conservative
+                    if swiftUIGenericTypes.contains(where: { view.isKind(of: $0) }), !isSwiftUILayerSafe(view.layer) {
+                        if isTextInputSensitive(view, maskConfig), !hasSubViews {
+                            maskableWidgets.append(view.toAbsoluteRect(window))
+                            return
+                        }
                     }
                 }
             }
@@ -881,9 +834,7 @@
             let wireframe = createBasicWireframe(window)
 
             let drawSpan = perf.begin("DrawHierarchy")
-            let image = DI.main.viewLayoutPublisher.performWithoutPublishing {
-                window.toImage()
-            }
+            let image = window.toImage()
             perf.end(drawSpan, phase: "draw_hierarchy")
 
             if let image = image {
@@ -1182,14 +1133,6 @@
 
             guard let window = UIApplication.getCurrentWindow() else {
                 return
-            }
-
-            guard beginSnapshotCapture() else {
-                return
-            }
-
-            defer {
-                finishSnapshotCapture()
             }
 
             var screenName: String?

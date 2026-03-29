@@ -4,6 +4,10 @@
     import os.log
     import os.signpost
 
+    extension Notification.Name {
+        static let postHogSessionReplayPerformanceReport = Notification.Name("PostHogSessionReplayPerformanceReport")
+    }
+
     final class SessionReplayPerformanceTracker {
         static let shared = SessionReplayPerformanceTracker()
 
@@ -11,6 +15,7 @@
         private let statsLock = NSLock()
         private var stats: [String: [Double]] = [:]
         private var snapshotCount = 0
+        private var pendingReportCount: Int?
         private let reportInterval = 30
 
         struct Span {
@@ -31,19 +36,25 @@
 
             statsLock.lock()
             stats[phase, default: []].append(durationMs)
+
             if phase == "total_main_thread" {
                 snapshotCount += 1
+                if snapshotCount > 0 && snapshotCount % reportInterval == 0 {
+                    pendingReportCount = snapshotCount
+                }
             }
-            let shouldReport = snapshotCount > 0 && snapshotCount % reportInterval == 0
+
+            let shouldReport = phase == "total_background" && pendingReportCount != nil
             let currentStats = shouldReport ? stats : nil
-            let currentCount = snapshotCount
+            let currentCount = pendingReportCount
             if shouldReport {
+                pendingReportCount = nil
                 stats.removeAll(keepingCapacity: true)
             }
             statsLock.unlock()
 
-            if let snapshot = currentStats {
-                printReport(snapshot, count: currentCount)
+            if let snapshot = currentStats, let count = currentCount {
+                printReport(snapshot, count: count)
             }
         }
 
