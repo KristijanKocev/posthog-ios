@@ -38,45 +38,39 @@ class RRWireframe {
     var parentId: Int?
 
     #if os(iOS)
-        private func hasMaskableWidgets() -> Bool {
-            guard let maskableWidgets else {
-                return false
-            }
-
-            return !maskableWidgets.isEmpty
-        }
-
         private func maskImage() -> UIImage? {
-            guard hasMaskableWidgets(), let image else {
+            guard let image = image else { return nil }
+
+            // Skip re-rendering entirely when there are no widgets to mask —
+            // avoids creating a full-size copy of the image just to draw it back unchanged
+            guard let maskableWidgets = maskableWidgets, !maskableWidgets.isEmpty else {
                 return nil
             }
 
-            return autoreleasepool {
-                // the scale also affects the image size/resolution, from usually 100kb to 15kb each
-                UIGraphicsImageRenderer(size: image.size, format: .init(for: .init(displayScale: 1))).image { context in
-                    context.cgContext.interpolationQuality = .none
-                    image.draw(at: .zero)
+            // Use custom CGContext renderer for masking — faster than UIGraphicsImageRenderer.
+            // Use scale=1 since we only need to draw masking rects over the existing image.
+            let renderer = PostHogGraphicsImageRenderer(size: image.size, scale: 1)
+            return renderer.image { context in
+                context.interpolationQuality = .none
+                image.draw(at: .zero)
 
-                    if let maskableWidgets = maskableWidgets {
-                        for rect in maskableWidgets {
-                            let path = UIBezierPath(roundedRect: rect, cornerRadius: 10)
-                            UIColor.black.setFill()
-                            path.fill()
-                        }
-                    }
+                for rect in maskableWidgets {
+                    let path = UIBezierPath(roundedRect: rect, cornerRadius: 10)
+                    UIColor.black.setFill()
+                    path.fill()
                 }
             }
         }
     #endif
 
     func toDict() -> [String: Any] {
-        var dict: [String: Any] = [
-            "id": id,
-            "x": posX,
-            "y": posY,
-            "width": width,
-            "height": height,
-        ]
+        // Pre-size with enough capacity for all possible keys to avoid rehashing
+        var dict = [String: Any](minimumCapacity: 16)
+        dict["id"] = id
+        dict["x"] = posX
+        dict["y"] = posY
+        dict["width"] = width
+        dict["height"] = height
 
         if let childWireframes = childWireframes {
             dict["childWireframes"] = childWireframes.map { $0.toDict() }
@@ -104,15 +98,22 @@ class RRWireframe {
 
         #if os(iOS)
             if let image = image {
-                base64 = autoreleasepool {
-                    if hasMaskableWidgets(), let maskedImage = maskImage() {
-                        return maskedImage.toBase64()
-                    }
+                let perf = SessionReplayPerformanceTracker.shared
 
-                    return image.toBase64()
+                let maskSpan = perf.begin("MaskImage")
+                let maskedImage = maskImage()
+                perf.end(maskSpan, phase: "mask_image")
+
+                let encodeSpan = perf.begin("Base64Encode")
+                if let maskedImage = maskedImage {
+                    self.image = nil
+                    base64 = maskedImage.toBase64()
+                } else {
+                    base64 = image.toBase64()
+                    self.image = nil
                 }
+                perf.end(encodeSpan, phase: "base64_encode")
 
-                self.image = nil
                 maskableWidgets = nil
             }
         #endif
